@@ -1,9 +1,11 @@
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 
 from django.db import IntegrityError, transaction
 from django.utils import timezone
+from rest_framework.exceptions import ValidationError
 
 from .exceptions import (
+    AlreadyReturned,
     AssetUnavailable,
     CheckoutLimitReached,
     InactiveEmployee,
@@ -80,3 +82,63 @@ def checkout_asset(
         asset.save(update_fields=["status", "updated_at"])
 
     return checkout
+
+
+def return_checkout(
+    *,
+    checkout_id: int,
+    condition_note: str = "",
+    needs_maintenance: bool = False,
+    now: datetime | None = None,
+) -> CheckOut:
+    """Close an open check-out and release (or quarantine) its asset.
+
+    404 NotFound for an unknown id, 409 AlreadyReturned if already closed.
+    """
+    now = now or timezone.now()
+    with transaction.atomic():
+        # Lock the checkout first so two concurrent returns can't both pass the
+        # returned_at check. select_related is avoided here: FOR UPDATE would then
+        # also lock the joined rows, and we want to lock the asset explicitly.
+        try:
+            checkout = CheckOut.objects.select_for_update().get(pk=checkout_id)
+        except CheckOut.DoesNotExist:
+            raise NotFound(f"Check-out {checkout_id} not found.")
+        if checkout.returned_at is not None:
+            raise AlreadyReturned()
+
+        # checkout -> asset order; check-out creation never locks CheckOut rows,
+        # so this cannot form a cycle with employee -> asset.
+        asset = Asset.objects.select_for_update().get(pk=checkout.asset_id)
+
+        checkout.returned_at = now
+        checkout.condition_note = condition_note
+        checkout.save(update_fields=["returned_at", "condition_note"])
+
+        asset.status = Asset.Status.MAINTENANCE if needs_maintenance else Asset.Status.AVAILABLE
+        asset.save(update_fields=["status", "updated_at"])
+
+    checkout.asset = asset
+    return checkout
+
+
+def create_asset(
+    *,
+    asset_tag: str,
+    name: str,
+    category: str,
+    purchase_date: date,
+    status: str = Asset.Status.AVAILABLE,
+) -> Asset:
+    try:
+        with transaction.atomic():
+            return Asset.objects.create(
+                asset_tag=asset_tag,
+                name=name,
+                category=category,
+                purchase_date=purchase_date,
+                status=status,
+            )
+    except IntegrityError:
+        # Lost a race with a concurrent create of the same tag.
+        raise ValidationError({"asset_tag": ["asset with this asset tag already exists."]})
