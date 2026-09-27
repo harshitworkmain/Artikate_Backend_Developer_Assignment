@@ -1,0 +1,75 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: assetsvc
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d assetsvc"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      SECRET_KEY: ci-secret-key
+      DEBUG: "False"
+      ALLOWED_HOSTS: localhost,127.0.0.1
+      DATABASE_URL: postgres://postgres:postgres@localhost:5432/assetsvc
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Django checks
+        run: |
+          python manage.py check
+          python manage.py makemigrations --check --dry-run
+      - name: Migrate
+        run: python manage.py migrate --noinput
+      - name: Tests
+        run: pytest -q
+
+  compose:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and start stack
+        run: docker compose up -d --build --wait --wait-timeout 180
+      - name: Migrate
+        run: docker compose exec -T web python manage.py migrate --noinput
+      - name: Seed demo data
+        run: docker compose exec -T web python manage.py seed_demo_data
+      - name: Health check
+        run: curl -f --retry 10 --retry-delay 3 --retry-all-errors http://localhost:8000/api/v1/health/
+      - name: Authenticated smoke test
+        run: |
+          token=$(curl -sf -X POST -d "username=demo&password=demo-password" http://localhost:8000/api/v1/auth/token/ | python3 -c "import json,sys; print(json.load(sys.stdin)['token'])")
+          curl -f -H "Authorization: Token $token" http://localhost:8000/api/v1/reports/overdue/
+      - name: Worker and beat are running
+        run: |
+          test "$(docker compose ps --status running --services | sort | tr '\n' ' ')" = "beat db redis web worker "
+          for i in $(seq 1 10); do
+            docker compose exec -T worker celery -A config inspect ping && exit 0
+            sleep 3
+          done
+          exit 1
+      - name: Logs on failure
+        if: failure()
+        run: docker compose logs
+      - name: Tear down
+        if: always()
+        run: docker compose down -v

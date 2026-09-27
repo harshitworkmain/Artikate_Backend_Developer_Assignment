@@ -1,6 +1,7 @@
 from pathlib import Path
 
 import environ
+from celery.schedules import crontab
 from django.core.exceptions import ImproperlyConfigured
 
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -101,3 +102,10 @@ REST_FRAMEWORK = {
 }
 
 CELERY_BROKER_URL = env("CELERY_BROKER_URL", default="redis://localhost:6379/0")
+CELERY_TIMEZONE = TIME_ZONE
+CELERY_BEAT_SCHEDULE = {
+    "flag-overdue-checkouts-hourly": {
+        "task": "apps.inventory.tasks.flag_overdue_checkouts",
+        "schedule": crontab(minute=0),
+    },
+}
